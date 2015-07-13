@@ -50,13 +50,13 @@
 
 #include "http2.h"
 #include "buffer.h"
-#include "template.h"
 
 using namespace nghttp2;
 
 namespace h2load {
 
 class Session;
+struct Worker;
 
 struct Config {
   std::vector<std::vector<nghttp2_nv>> nva;
@@ -65,7 +65,6 @@ struct Config {
   std::string scheme;
   std::string host;
   std::string ifile;
-  std::string ciphers;
   // length of upload data
   int64_t data_length;
   addrinfo *addrs;
@@ -82,9 +81,20 @@ struct Config {
   uint16_t port;
   uint16_t default_port;
   bool verbose;
+  ssize_t nconns;
+  ssize_t rate;
+
+  ssize_t current_worker;
+  std::vector<std::unique_ptr<Worker>> workers;
+  SSL_CTX *ssl_ctx;
+  struct ev_loop *rate_loop;
+  ssize_t seconds;
+  ssize_t conns_remainder;
 
   Config();
   ~Config();
+
+  bool is_rate_mode();
 };
 
 struct RequestStat {
@@ -202,7 +212,7 @@ struct Client {
   // The number of requests this client has done so far.
   size_t req_done;
   int fd;
-  Buffer<64_k> wb;
+  Buffer<65536> wb;
 
   enum { ERR_CONNECT_FAIL = -100 };
 

@@ -75,7 +75,8 @@ Config::Config()
     : data_length(-1), addrs(nullptr), nreqs(1), nclients(1), nthreads(1),
       max_concurrent_streams(-1), window_bits(30), connection_window_bits(30),
       no_tls_proto(PROTO_HTTP2), data_fd(-1), port(0), default_port(0),
-      verbose(false) {}
+      verbose(false), 
+      nconns(0), rate(0), current_worker(0) {}
 
 Config::~Config() {
   freeaddrinfo(addrs);
@@ -83,6 +84,10 @@ Config::~Config() {
   if (data_fd != -1) {
     close(data_fd);
   }
+}
+
+bool Config::is_rate_mode() {
+  return (this->rate != 0);
 }
 
 Config config;
@@ -261,7 +266,8 @@ void Client::process_abandoned_streams() {
 }
 
 void Client::report_progress() {
-  if (worker->id == 0 &&
+  
+  if (!worker->config->is_rate_mode() && worker->id == 0 &&
       worker->stats.req_done % worker->progress_interval == 0) {
     std::cout << "progress: "
               << worker->stats.req_done * 100 / worker->stats.req_todo
@@ -270,9 +276,29 @@ void Client::report_progress() {
 }
 
 namespace {
+const char *get_tls_protocol(SSL *ssl) {
+  auto session = SSL_get_session(ssl);
+
+  switch (session->ssl_version) {
+  case SSL2_VERSION:
+    return "SSLv2";
+  case SSL3_VERSION:
+    return "SSLv3";
+  case TLS1_2_VERSION:
+    return "TLSv1.2";
+  case TLS1_1_VERSION:
+    return "TLSv1.1";
+  case TLS1_VERSION:
+    return "TLSv1";
+  default:
+    return "unknown";
+  }
+}
+} // namespace
+
+namespace {
 void print_server_tmp_key(SSL *ssl) {
-// libressl does not have SSL_get_server_tmp_key
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && defined(SSL_get_server_tmp_key)
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
   EVP_PKEY *key;
 
   if (!SSL_get_server_tmp_key(ssl, &key)) {
@@ -312,7 +338,7 @@ void Client::report_tls_info() {
   if (worker->id == 0 && !worker->tls_info_report_done) {
     worker->tls_info_report_done = true;
     auto cipher = SSL_get_current_cipher(ssl);
-    std::cout << "Protocol: " << ssl::get_tls_protocol(ssl) << "\n"
+    std::cout << "Protocol: " << get_tls_protocol(ssl) << "\n"
               << "Cipher: " << SSL_CIPHER_get_name(cipher) << std::endl;
     print_server_tmp_key(ssl);
   }
@@ -485,7 +511,7 @@ int Client::on_write() {
 }
 
 int Client::read_clear() {
-  uint8_t buf[8_k];
+  uint8_t buf[8192];
 
   for (;;) {
     ssize_t nread;
@@ -605,7 +631,7 @@ int Client::tls_handshake() {
 }
 
 int Client::read_tls() {
-  uint8_t buf[8_k];
+  uint8_t buf[8192];
 
   ERR_clear_error();
 
@@ -706,7 +732,13 @@ Worker::Worker(uint32_t id, SSL_CTX *ssl_ctx, size_t req_todo, size_t nclients,
     : stats(req_todo), loop(ev_loop_new(0)), ssl_ctx(ssl_ctx), config(config),
       id(id), tls_info_report_done(false) {
   stats.req_todo = req_todo;
-  progress_interval = std::max((size_t)1, req_todo / 10);
+
+  if (this->config->is_rate_mode()) {
+    progress_interval = req_todo;
+  }
+  else { 
+    progress_interval = std::max((size_t)1, req_todo / 10);
+  }
 
   auto nreqs_per_client = req_todo / nclients;
   auto nreqs_rem = req_todo % nclients;
@@ -760,7 +792,7 @@ namespace {
 // percentage of number of samples within mean +/- sd are computed.
 template <typename Duration>
 TimeStat<Duration> compute_time_stat(const std::vector<Duration> &samples) {
-  if (samples.empty()) {
+  if (samples.size() == 0) {
     return {Duration::zero(), Duration::zero(), Duration::zero(),
             Duration::zero(), 0.0};
   }
@@ -781,7 +813,6 @@ TimeStat<Duration> compute_time_stat(const std::vector<Duration> &samples) {
     a = na;
   }
 
-  assert(n > 0);
   res.mean = Duration(sum / n);
   res.sd = Duration(static_cast<typename Duration::rep>(sqrt(q / n)));
   res.within_sd = within_sd(samples, res.mean, res.sd);
@@ -963,6 +994,33 @@ std::vector<std::string> read_uri_from_file(std::istream &infile) {
 } // namespace
 
 namespace {
+// Called every second when rate mode is being used
+void second_timeout_cb(EV_P_ ev_timer *w, int revents) {
+  auto config = static_cast<Config *>(w->data);
+  
+  auto nclients_per_worker = config->rate;
+  auto nreqs_per_worker = config->max_concurrent_streams * config->rate;
+
+  if(config->current_worker >= std::max(0. , (config->seconds - 1.))) { 
+    nclients_per_worker = config->rate + config->conns_remainder;
+    nreqs_per_worker = (int)config->max_concurrent_streams * 
+                       (config->rate + config->conns_remainder);
+    ev_timer_stop(config->rate_loop, w);
+  }
+
+  config->workers.push_back(make_unique<Worker>(config->current_worker, 
+                                                config->ssl_ctx, 
+                                                nreqs_per_worker, 
+                                                nclients_per_worker, 
+                                                config));
+  
+  config->current_worker++;
+
+  config->workers.back()->run();
+}
+} // namespace
+
+namespace {
 void print_version(std::ostream &out) {
   out << "h2load nghttp2/" NGHTTP2_VERSION << std::endl;
 }
@@ -1021,9 +1079,6 @@ Options:
               Default: )" << config.connection_window_bits << R"(
   -H, --header=<HEADER>
               Add/Override a header to the requests.
-  --ciphers=<SUITE>
-              Set allowed  cipher list.  The  format of the  string is
-              described in OpenSSL ciphers(1).
   -p, --no-tls-proto=<PROTOID>
               Specify ALPN identifier of the  protocol to be used when
               accessing http URI without SSL/TLS.)";
@@ -1039,6 +1094,24 @@ Options:
   -d, --data=<FILE>
               Post FILE to  server.  The request method  is changed to
               POST.
+  -r, --rate=<N>
+              Specified the fixed rate at which connections are
+              created. The rate must be a positive integer,
+              representing the number of connections to be made per
+              second. When the rate is 0, the program will run as it
+              normally does, creating connections at whatever variable
+              rate it wants. The default value for this option is 0.
+  -C, --num-conns=<N>
+              Specifies the total number of connections to create. The
+              total number of connections must be a positive integer.
+              On each connection, '-m' requests are made. The test
+              stops once as soon as the N connections have either 
+              completed or failed. When the number of connections is
+              0, the program will run as it normally does, creating as
+              many connections as it needs in order to make the '-n' 
+              requests specified. The defauly value for this option is
+              0. The '-n' option is not required if the '-C' option
+              is being used.  
   -v, --verbose
               Output debug information.
   --version   Display version information and exit.
@@ -1072,11 +1145,12 @@ int main(int argc, char **argv) {
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, &flag, 1},
-        {"ciphers", required_argument, &flag, 2},
+	      {"rate", required_argument, nullptr, 'r'},
+	      {"num-conns", required_argument, nullptr, 'C'},
         {nullptr, 0, nullptr, 0}};
     int option_index = 0;
-    auto c = getopt_long(argc, argv, "hvW:c:d:m:n:p:t:w:H:i:", long_options,
-                         &option_index);
+    auto c = getopt_long(argc, argv, "hvW:c:d:m:n:p:t:w:H:i:r:C:", 
+                         long_options, &option_index);
     if (c == -1) {
       break;
     }
@@ -1173,6 +1247,24 @@ int main(int argc, char **argv) {
     case 'v':
       config.verbose = true;
       break;
+    case 'r':
+      config.rate = strtoul(optarg, nullptr, 10);
+      if (config.rate <= 0) { 
+        std::cerr << "-r: the rate at which connections are made "
+                  << "must be positive."
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }       
+      break;
+    case 'C':
+      config.nconns = strtoul(optarg, nullptr, 10);
+      if (config.nconns <= 0) {
+        std::cerr << "-C: the total number of connections made "
+                  << "must be positive."
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      break;
     case 'h':
       print_help(std::cout);
       exit(EXIT_SUCCESS);
@@ -1185,10 +1277,6 @@ int main(int argc, char **argv) {
         // version option
         print_version(std::cout);
         exit(EXIT_SUCCESS);
-      case 2:
-        // ciphers option
-        config.ciphers = optarg;
-        break;
       }
       break;
     default:
@@ -1219,6 +1307,25 @@ int main(int argc, char **argv) {
     std::cerr << "-t: the number of threads must be strictly greater than 0."
               << std::endl;
     exit(EXIT_FAILURE);
+  }
+
+  if (config.nconns < 0) {
+    std::cerr << "-C: the total number of connections made "
+              << "cannot be negative."
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  if (config.rate < 0) {
+    std::cerr << "-r: the rate at which connections are made "
+              << "cannot be negative."
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  if (config.rate != 0 && config.nthreads != 1) {
+    std::cerr << "-r, -t: warning: the -t option will be ignored when the -r "
+              << "option is in use." << std::endl;
   }
 
   if (config.nreqs < config.nclients) {
@@ -1264,25 +1371,16 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  auto ssl_opts = (SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) |
-                  SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION |
-                  SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
-
-  SSL_CTX_set_options(ssl_ctx, ssl_opts);
+  SSL_CTX_set_options(ssl_ctx,
+                      SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+                          SSL_OP_NO_COMPRESSION |
+                          SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
   SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
   SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
 
-  const char *ciphers;
-  if (config.ciphers.empty()) {
-    ciphers = ssl::DEFAULT_CIPHER_LIST;
-  } else {
-    ciphers = config.ciphers.c_str();
-  }
-
-  if (SSL_CTX_set_cipher_list(ssl_ctx, ciphers) == 0) {
-    std::cerr << "SSL_CTX_set_cipher_list with " << ciphers
-              << " failed: " << ERR_error_string(ERR_get_error(), nullptr)
-              << std::endl;
+  if (SSL_CTX_set_cipher_list(ssl_ctx, ssl::DEFAULT_CIPHER_LIST) == 0) {
+    std::cerr << "SSL_CTX_set_cipher_list failed: "
+              << ERR_error_string(ERR_get_error(), nullptr) << std::endl;
     exit(EXIT_FAILURE);
   }
 
@@ -1324,6 +1422,41 @@ int main(int argc, char **argv) {
 
   if (config.max_concurrent_streams == -1) {
     config.max_concurrent_streams = reqlines.size();
+  }
+
+  // if not in rate mode and -C is set, warn that we are ignoring it
+  if (!config.is_rate_mode() && config.nconns != 0) {
+    std::cerr << "-C: warning: This option can only be used with -r, and"
+              << " will be ignored otherwise." << std::endl;
+  }
+
+  ssize_t n_time = 0;
+  ssize_t c_time = 0; 
+  // only care about n_time and c_time in rate mode
+  if (config.is_rate_mode() && config.max_concurrent_streams != 0) {
+    n_time = (int)config.nreqs / 
+             ((int)config.rate * (int)config.max_concurrent_streams);
+    c_time = (int)config.nconns / (int)config.rate;
+  }
+
+  // check to see if the two ways of determining test time conflict
+  if (config.is_rate_mode() && (int)config.max_concurrent_streams != 0 &&
+      (n_time != c_time) && config.nreqs != 1 && config.nconns != 0) {
+    if ((int)config.nreqs < config.nconns) {
+      std::cerr << "-C, -n: warning: two different test times are being set. "
+                << std::endl;
+      std::cerr << "The test will run for "
+                << c_time
+                << " seconds." << std::endl;
+    }
+    else {
+      std::cout << "-C, -n: warning: two different test times are being set. "
+                << std::endl;
+      std::cout << "The smaller of the two will be chosen and the test will "
+                << "run for "
+                << std::min(n_time, c_time)
+                << " seconds." << std::endl;
+    }
   }
 
   Headers shared_nva;
@@ -1405,46 +1538,92 @@ int main(int argc, char **argv) {
 
   auto start = std::chrono::steady_clock::now();
 
-  std::vector<std::unique_ptr<Worker>> workers;
-  workers.reserve(config.nthreads);
-
+  // if not in rate mode, continue making workers and clients normally
+  if (!config.is_rate_mode()) {
+    config.workers.reserve(config.nthreads);
 #ifndef NOTHREADS
-  std::vector<std::future<void>> futures;
-  for (size_t i = 0; i < config.nthreads - 1; ++i) {
-    auto nreqs = nreqs_per_thread + (nreqs_rem-- > 0);
-    auto nclients = nclients_per_thread + (nclients_rem-- > 0);
-    std::cout << "spawning thread #" << i << ": " << nclients
-              << " concurrent clients, " << nreqs << " total requests"
-              << std::endl;
-    workers.push_back(
-        make_unique<Worker>(i, ssl_ctx, nreqs, nclients, &config));
-    auto &worker = workers.back();
-    futures.push_back(
-        std::async(std::launch::async, [&worker]() { worker->run(); }));
-  }
+    std::vector<std::future<void>> futures;
+    for (size_t i = 0; i < config.nthreads - 1; ++i) {
+      auto nreqs = nreqs_per_thread + (nreqs_rem-- > 0);
+      auto nclients = nclients_per_thread + (nclients_rem-- > 0);
+      std::cout << "spawning thread #" << i << ": " << nclients
+                << " concurrent clients, " << nreqs << " total requests"
+                << std::endl;
+      config.workers.push_back(
+          make_unique<Worker>(i, ssl_ctx, nreqs, nclients, &config));
+      auto &worker = config.workers.back();
+      futures.push_back(
+          std::async(std::launch::async, [&worker]() { worker->run(); }));
+    }
 #endif // NOTHREADS
 
-  auto nreqs_last = nreqs_per_thread + (nreqs_rem-- > 0);
-  auto nclients_last = nclients_per_thread + (nclients_rem-- > 0);
-  std::cout << "spawning thread #" << (config.nthreads - 1) << ": "
-            << nclients_last << " concurrent clients, " << nreqs_last
-            << " total requests" << std::endl;
-  workers.push_back(make_unique<Worker>(config.nthreads - 1, ssl_ctx,
-                                        nreqs_last, nclients_last, &config));
-  workers.back()->run();
+    auto nreqs_last = nreqs_per_thread + (nreqs_rem-- > 0);
+    auto nclients_last = nclients_per_thread + (nclients_rem-- > 0);
+    std::cout << "spawning thread #" << (config.nthreads - 1) << ": "
+              << nclients_last << " concurrent clients, " << nreqs_last
+              << " total requests" << std::endl;
+    config.workers.push_back(make_unique<Worker>(config.nthreads - 1, ssl_ctx,
+                                          nreqs_last, nclients_last, &config));
+    config.workers.back()->run();
 
 #ifndef NOTHREADS
-  for (auto &fut : futures) {
-    fut.get();
-  }
+    for (auto &fut : futures) {
+      fut.get();
+    }
 #endif // NOTHREADS
+  } //!config.is_rate_mode()
+  // if in rate mode, create a new worker each second
+  else {
+    // set various config values
+    config.seconds = std::min(n_time, c_time);
 
+    if ((int)config.nreqs < config.nconns) {
+      config.seconds = c_time;
+      config.workers.reserve(config.seconds);
+    }
+    else if (config.nconns == 0) {
+      config.seconds = n_time;
+    }
+    else {
+      config.workers.reserve(config.seconds);
+    }
+
+    config.conns_remainder = config.nconns % config.rate;
+    
+    // config.seconds must be positive or else an exception is thrown
+    if (config.seconds <= 0) {
+      std::cerr << "Test cannot be run with current option values."
+                << " Please look at documentation for -r option for"
+                << " more information." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    config.current_worker = 0;
+    
+    config.ssl_ctx = ssl_ctx;
+
+    // create timer that will go off every second
+    ev_timer timeout_watcher;
+    
+    // create loop for running the timer
+    struct ev_loop *rate_loop = EV_DEFAULT;
+    
+    config.rate_loop = rate_loop;
+
+    // giving the second_timeout_cb access to config
+    timeout_watcher.data = &config; 
+
+    ev_init(&timeout_watcher, second_timeout_cb);
+    timeout_watcher.repeat = 1.;
+    ev_timer_again(rate_loop, &timeout_watcher);
+    ev_run(rate_loop, 0);
+  } // end rate mode section
+  
   auto end = std::chrono::steady_clock::now();
   auto duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
   Stats stats(0);
-  for (const auto &w : workers) {
+  for (const auto &w : config.workers) {
     const auto &s = w->stats;
 
     stats.req_todo += s.req_todo;
@@ -1463,7 +1642,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  auto ts = process_time_stats(workers);
+  auto ts = process_time_stats(config.workers);
 
   // Requests which have not been issued due to connection errors, are
   // counted towards req_failed and req_error.
@@ -1476,7 +1655,7 @@ int main(int argc, char **argv) {
   //
   // [1] https://github.com/lighttpd/weighttp
   // [2] https://github.com/wg/wrk
-  size_t rps = 0;
+  double rps = 0;
   int64_t bps = 0;
   if (duration.count() > 0) {
     auto secd = static_cast<double>(duration.count()) / (1000 * 1000);
