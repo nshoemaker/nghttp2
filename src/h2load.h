@@ -90,6 +90,7 @@ struct Config {
 
   ssize_t current_worker;
   std::vector<std::unique_ptr<Worker>> workers;
+  std::vector<std::future<void>> futures;
   SSL_CTX *ssl_ctx;
   struct ev_loop *rate_loop;
   ssize_t seconds;

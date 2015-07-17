@@ -983,9 +983,12 @@ void second_timeout_cb(EV_P_ ev_timer *w, int revents) {
       make_unique<Worker>(config->current_worker, config->ssl_ctx,
                           nreqs_per_worker, nclients_per_worker, config));
 
+  auto &worker = config->workers.back();
+
   config->current_worker++;
 
-  config->workers.back()->run();
+  config->futures.push_back(
+          std::async(std::launch::async, [&worker]() { worker->run(); }));
 }
 } // namespace
 
@@ -1523,7 +1526,6 @@ int main(int argc, char **argv) {
   if (!config.is_rate_mode()) {
     config.workers.reserve(config.nthreads);
 #ifndef NOTHREADS
-    std::vector<std::future<void>> futures;
     for (size_t i = 0; i < config.nthreads - 1; ++i) {
       auto nreqs = nreqs_per_thread + (nreqs_rem-- > 0);
       auto nclients = nclients_per_thread + (nclients_rem-- > 0);
@@ -1533,7 +1535,7 @@ int main(int argc, char **argv) {
       config.workers.push_back(
           make_unique<Worker>(i, ssl_ctx, nreqs, nclients, &config));
       auto &worker = config.workers.back();
-      futures.push_back(
+      config.futures.push_back(
           std::async(std::launch::async, [&worker]() { worker->run(); }));
     }
 #endif // NOTHREADS
@@ -1548,7 +1550,7 @@ int main(int argc, char **argv) {
     config.workers.back()->run();
 
 #ifndef NOTHREADS
-    for (auto &fut : futures) {
+    for (auto &fut : config.futures) {
       fut.get();
     }
 #endif // NOTHREADS
@@ -1593,6 +1595,10 @@ int main(int argc, char **argv) {
     timeout_watcher.repeat = 1.;
     ev_timer_again(rate_loop, &timeout_watcher);
     ev_run(rate_loop, 0);
+
+    for (auto &fut : config.futures) {
+      fut.get();
+    }
   } // end rate mode section
 
   auto end = std::chrono::steady_clock::now();
