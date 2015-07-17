@@ -1319,11 +1319,6 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  if (config.rate != 0 && config.nthreads != 1) {
-    std::cerr << "-r, -t: warning: the -t option will be ignored when the -r "
-              << "option is in use." << std::endl;
-  }
-
   if (!datafile.empty()) {
     config.data_fd = open(datafile.c_str(), O_RDONLY | O_BINARY);
     if (config.data_fd == -1) {
