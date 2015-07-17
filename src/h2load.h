@@ -41,6 +41,7 @@
 #include <memory>
 #include <chrono>
 #include <array>
+#include <future>
 
 #include <nghttp2/nghttp2.h>
 
