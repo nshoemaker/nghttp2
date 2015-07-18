@@ -983,12 +983,53 @@ void second_timeout_cb(EV_P_ ev_timer *w, int revents) {
       make_unique<Worker>(config->current_worker, config->ssl_ctx,
                           nreqs_per_worker, nclients_per_worker, config));
 
-  auto &worker = config->workers.back();
-
   config->current_worker++;
 
-  config->futures.push_back(
-          std::async(std::launch::async, [&worker]() { worker->run(); }));
+  config->workers.back()->run();
+}
+} // namespace
+
+namespace {
+// Called every second when rate mode is being used
+void second_timeout_mt_cb(EV_P_ ev_timer *w, int revents) {
+  auto config = static_cast<Config *>(w->data);
+
+  auto current_second = config->current_worker;
+
+  auto nclients_per_second = config->rate;
+  auto nreqs_per_second = (config->max_concurrent_streams * config->rate);
+
+  if (current_second >= std::max((ssize_t)0, (config->seconds - 1))) {
+    nclients_per_second = config->rate + config->conns_remainder;
+    nreqs_per_second = (int)config->max_concurrent_streams *
+                       (config->rate + config->conns_remainder);
+    ev_timer_stop(config->rate_loop, w);
+  }
+
+  auto nclients_per_thread = nclients_per_second / config->nthreads;
+  auto nreqs_per_thread = nreqs_per_second / config->nthreads;
+  auto nclients_rem = nclients_per_second % config->nthreads;
+  auto nreqs_rem = nreqs_per_second % config->nthreads;
+
+  for (size_t i = 0; i < config->nthreads; ++i) {
+    auto nreqs_per_worker = nreqs_per_thread + (nreqs_rem-- > 0);
+    auto nclients_per_worker = nclients_per_thread + (nclients_rem-- > 0);
+    
+    config->workers.push_back(
+            make_unique<Worker>((current_second * config->nthreads) + i, 
+                                config->ssl_ctx,
+                                nreqs_per_worker, nclients_per_worker, 
+                                config));
+    
+    auto &worker = config->workers.back();
+
+    config->futures.push_back(
+            std::async(std::launch::async, [&worker]() { worker->run(); }));
+
+  }
+  std::cout << config->current_worker << std::endl;
+  config->current_worker++;
+
 }
 } // namespace
 
@@ -1564,7 +1605,7 @@ int main(int argc, char **argv) {
     } else {
       config.seconds = std::min(n_time, c_time);
     }
-    config.workers.reserve(config.seconds);
+    config.workers.reserve(config.seconds * config.nthreads);
 
     config.conns_remainder = config.nconns % config.rate;
 
@@ -1590,14 +1631,20 @@ int main(int argc, char **argv) {
     // giving the second_timeout_cb access to config
     timeout_watcher.data = &config;
 
-    ev_init(&timeout_watcher, second_timeout_cb);
+#ifndef NOTHREADS
+    ev_init(&timeout_watcher, second_timeout_mt_cb);
+#else
+    ev_init(&timeout_watcher, second_timeout_cb);  
+#endif // NOTHREADS
     timeout_watcher.repeat = 1.;
     ev_timer_again(rate_loop, &timeout_watcher);
     ev_run(rate_loop, 0);
 
+#ifndef NOTHREADS
     for (auto &fut : config.futures) {
       fut.get();
     }
+#endif // NOTHREADS
   } // end rate mode section
 
   auto end = std::chrono::steady_clock::now();
