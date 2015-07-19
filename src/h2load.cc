@@ -1014,8 +1014,6 @@ void second_timeout_mt_cb(EV_P_ ev_timer *w, int revents) {
   for (size_t i = 0; i < config->nthreads; ++i) {
     auto nreqs_per_worker = nreqs_per_thread + (nreqs_rem-- > 0);
     auto nclients_per_worker = nclients_per_thread + (nclients_rem-- > 0);
-    std::cout << "nreqs_per_worker: " << nreqs_per_worker << std::endl;
-    std::cout << "nclient_per_worker: " << nclients_per_worker << std::endl;
     
     config->workers.push_back(
             make_unique<Worker>((current_second * config->nthreads) + i, 
@@ -1029,7 +1027,6 @@ void second_timeout_mt_cb(EV_P_ ev_timer *w, int revents) {
             std::async(std::launch::async, [&worker]() { worker->run(); }));
 
   }
-  std::cout << config->current_worker << std::endl;
   config->current_worker++;
 
 }
