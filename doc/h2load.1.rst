@@ -124,6 +124,25 @@ OPTIONS
     for this option is 0.  The  :option:`-n` option is not required if
     the :option:`-C` option is being used.
 
+.. option:: -T, --connection-active-timeout=<N>
+
+    Specifies  the  maximum  time  that h2load is willing to 
+    keep a  connection  open, regardless of  the activity on 
+    said  connection. <N> must   be   a   positive  integer, 
+    specifying  the  number  of  seconds  to  wait.  When no 
+    timeout value is set (either active or inactive), h2load 
+    will keep a connection open indefinitely, waiting for  a 
+    response.
+
+.. option:: -N, --connection-inactivity-timeout=<N>
+
+    Specifies the amount of  time  that h2load is willing to 
+    wait to see activity on a given connection. <N> must  be  
+    a positive integer, specifying the number of seconds  to 
+    wait.  When  no  timeout  value is set (either active or 
+    inactive),  h2load   will   keep   a   connection   open 
+    indefinitely, waiting for a response.
+
 .. option:: -v, --verbose
 
     Output debug information.
