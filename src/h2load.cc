@@ -1324,7 +1324,7 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     }
 
-    if (nreqs_set_manually && config.rate > config.nreqs) {
+    if (config.rate > config.nreqs) {
       std::cerr << "-r, -n: the connection rate must be smaller than or equal "
                    "to the number of requests." << std::endl;
       exit(EXIT_FAILURE);
@@ -1335,6 +1335,13 @@ int main(int argc, char **argv) {
           << "-C, -t: the total number of connections must be greater than "
              "or equal "
           << "to the number of threads." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    if (config.nconns == 0 && !nreqs_set_manually) {
+      std::cerr
+          << "-r: the rate option must be used with either the -n option "
+             "or the -C option." << std::endl;
       exit(EXIT_FAILURE);
     }
   }
