@@ -1239,6 +1239,7 @@ int main(int argc, char **argv) {
   OPENSSL_config(nullptr);
 
   std::string datafile;
+  bool nreqs_set_manually = false;
   while (1) {
     static int flag = 0;
     static option long_options[] = {
@@ -1270,6 +1271,7 @@ int main(int argc, char **argv) {
     switch (c) {
     case 'n':
       config.nreqs = strtoul(optarg, nullptr, 10);
+      nreqs_set_manually = true;
       break;
     case 'c':
       config.nclients = strtoul(optarg, nullptr, 10);
@@ -1465,7 +1467,7 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     }
 
-    if (config.rate > config.nreqs) {
+    if (nreqs_set_manually && config.rate > config.nreqs) {
       std::cerr << "-r, -n: the connection rate must be smaller than or equal "
                    "to the number of requests." << std::endl;
       exit(EXIT_FAILURE);
