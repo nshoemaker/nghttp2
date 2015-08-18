@@ -1019,6 +1019,8 @@ namespace {
 void print_help(std::ostream &out) {
   print_usage(out);
 
+  auto config = Config();
+
   out << R"(
   <URI>       Specify URI to access.   Multiple URIs can be specified.
               URIs are used  in this order for each  client.  All URIs
@@ -1115,6 +1117,7 @@ int main(int argc, char **argv) {
   OPENSSL_config(nullptr);
 
   std::string datafile;
+  bool nreqs_set_manually = false;
   while (1) {
     static int flag = 0;
     static option long_options[] = {
@@ -1144,6 +1147,7 @@ int main(int argc, char **argv) {
     switch (c) {
     case 'n':
       config.nreqs = strtoul(optarg, nullptr, 10);
+      nreqs_set_manually = true;
       break;
     case 'c':
       config.nclients = strtoul(optarg, nullptr, 10);
@@ -1322,7 +1326,7 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     }
 
-    if (config.rate > config.nreqs) {
+    if (nreqs_set_manually && config.rate > config.nreqs) {
       std::cerr << "-r, -n: the connection rate must be smaller than or equal "
                    "to the number of requests." << std::endl;
       exit(EXIT_FAILURE);
@@ -1333,6 +1337,13 @@ int main(int argc, char **argv) {
           << "-C, -t: the total number of connections must be greater than "
              "or equal "
           << "to the number of threads." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    if (config.nconns == 0 && !nreqs_set_manually) {
+      std::cerr
+          << "-r: the rate option must be used with either the -n option "
+             "or the -C option." << std::endl;
       exit(EXIT_FAILURE);
     }
   }
@@ -1674,9 +1685,10 @@ int main(int argc, char **argv) {
   double rps = 0;
   int64_t bps = 0;
   if (duration.count() > 0) {
-    auto secd = static_cast<double>(duration.count()) / (1000 * 1000);
-    rps = stats.req_success / secd;
-    bps = stats.bytes_total / secd;
+    auto secd = std::chrono::duration_cast<
+        std::chrono::duration<double, std::chrono::seconds::period>>(duration);
+    rps = stats.req_success / secd.count();
+    bps = stats.bytes_total / secd.count();
   }
 
   std::cout << R"(
